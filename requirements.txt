@@ -1,4 +1,8 @@
-fastapi==0.115.0
+fastapi==0.115.14
 uvicorn[standard]==0.30.6
+
 numpy==1.26.4
-essentia
+essentia==2.1b6.dev1389
+
+cachetools==5.5.2
+orjson==3.11.6

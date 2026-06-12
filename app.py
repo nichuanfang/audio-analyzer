@@ -1,143 +1,236 @@
+import asyncio
 import logging
 import os
-from pathlib import Path
-import asyncio
 from concurrent.futures import ProcessPoolExecutor
 from contextlib import asynccontextmanager
-from functools import lru_cache
+from pathlib import Path
 
 import essentia.standard as es
 import uvicorn
+from cachetools import TTLCache, cached
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import ORJSONResponse
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
+
 logger = logging.getLogger("music-analyzer")
 
-# 配置参数
-MUSIC_ROOT = Path(os.getenv("MUSIC_ROOT", "/music")).resolve()
-PORT = int(os.getenv("PORT", 8000))
-MAX_ANALYSIS_SECONDS = 200  # 适合NAS性能，降低CPU负担
-CACHE_SIZE = 128  # 内存缓存大小，根据NAS内存调整
+# =========================
+# Config
+# =========================
 
-logger.info("MUSIC_ROOT = %s", MUSIC_ROOT)
-logger.info("MAX_ANALYSIS_SECONDS = %d", MAX_ANALYSIS_SECONDS)
+MUSIC_ROOT = Path(
+    os.getenv("MUSIC_ROOT", "/music")
+).resolve()
 
-# 全局进程池
+PORT = int(os.getenv("PORT", "8000"))
+
+MAX_ANALYSIS_SECONDS = 200
+
+MAX_WORKERS = min(
+    max((os.cpu_count() or 2) // 2, 1),
+    4,
+)
+
+CACHE_SIZE = 256
+CACHE_TTL = 86400  # 24h
+
+logger.info("MUSIC_ROOT=%s", MUSIC_ROOT)
+logger.info("MAX_WORKERS=%s", MAX_WORKERS)
+
+# =========================
+# Runtime
+# =========================
+
 executor: ProcessPoolExecutor | None = None
+
+feature_cache = TTLCache(
+    maxsize=CACHE_SIZE,
+    ttl=CACHE_TTL,
+)
+
+analysis_semaphore = asyncio.Semaphore(MAX_WORKERS)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global executor
-    # Startup
-    executor = ProcessPoolExecutor(max_workers=os.cpu_count() or 2)
-    logger.info("ProcessPoolExecutor 已启动，workers=%d", executor._max_workers)
+
+    executor = ProcessPoolExecutor(
+        max_workers=MAX_WORKERS
+    )
+
+    logger.info(
+        "ProcessPoolExecutor started workers=%s",
+        MAX_WORKERS,
+    )
+
     yield
-    # Shutdown
+
     if executor:
         executor.shutdown(wait=True)
-        logger.info("ProcessPoolExecutor 已关闭")
+        logger.info("ProcessPoolExecutor stopped")
 
 
-app = FastAPI(lifespan=lifespan)
+app = FastAPI(
+    title="Music Analyzer",
+    lifespan=lifespan,
+    default_response_class=ORJSONResponse,
+)
 
 
-@lru_cache(maxsize=CACHE_SIZE)
+# =========================
+# Feature Extraction
+# =========================
+
+@cached(feature_cache)
 def extract_features(audio_path: str) -> dict:
-    """CPU密集型特征提取函数（带缓存）"""
-    logger.info("开始提取特征: %s", audio_path)
+    logger.info("Analyzing: %s", audio_path)
+
+    loader = es.EasyLoader(
+        filename=audio_path,
+        sampleRate=44100,
+        startTime=0,
+        endTime=MAX_ANALYSIS_SECONDS,
+    )
+
+    audio = loader()
+
+    if len(audio) == 0:
+        raise ValueError("Empty audio")
+
+    duration = len(audio) / 44100
+
+    rhythm = es.RhythmExtractor2013(
+        method="multifeature"
+    )
+
+    rhythm_result = rhythm(audio)
+
+    bpm = float(rhythm_result[0])
+    bpm_conf = float(rhythm_result[2])
+
+    dance_result = es.Danceability()(audio)
+
+    if isinstance(dance_result, tuple):
+        danceability = float(dance_result[0])
+    elif hasattr(dance_result, "__getitem__"):
+        danceability = float(dance_result[0])
+    else:
+        danceability = float(dance_result)
+
+    key_result = es.KeyExtractor()(audio)
+
+    key = str(key_result[0])
+    scale = str(key_result[1])
+    key_conf = float(key_result[2])
+
+    return {
+        "bpm": round(bpm, 2),
+        "bpm_confidence": round(bpm_conf, 2),
+        "danceability": round(danceability, 2),
+        "key": key,
+        "scale": scale,
+        "key_confidence": round(key_conf, 2),
+        "analysis_duration": round(duration, 1),
+    }
+
+
+# =========================
+# Helpers
+# =========================
+
+def resolve_audio_path(
+    relative_path: str,
+) -> Path:
+    full_path = (
+        MUSIC_ROOT / relative_path.lstrip("/")
+    ).resolve()
 
     try:
-        loader = es.EasyLoader(
-            filename=audio_path,
-            sampleRate=44100,
-            startTime=0,
-            endTime=MAX_ANALYSIS_SECONDS,
+        full_path.relative_to(MUSIC_ROOT)
+    except ValueError:
+        raise HTTPException(
+            status_code=403,
+            detail="Illegal path",
         )
-        audio_vector = loader()
-        logger.info("音频加载完成，采样点数: %d", len(audio_vector))
 
-        if len(audio_vector) == 0:
-            raise ValueError("音频内容为空或无法解码")
+    if not full_path.exists():
+        raise HTTPException(
+            status_code=404,
+            detail="File not found",
+        )
 
-        duration = len(audio_vector) / 44100
-        if duration < 10:
-            logger.warning("音频过短（%.1f秒），特征提取准确性可能降低", duration)
+    if not full_path.is_file():
+        raise HTTPException(
+            status_code=400,
+            detail="Not a file",
+        )
 
-        # 节奏提取（multifeature 精度较高但较慢）
-        rhythm = es.RhythmExtractor2013(method="multifeature")
-        bpm, _, bpm_conf, _, _ = rhythm(audio_vector)
+    return full_path
 
-        # 舞曲度
-        dance = es.Danceability()(audio_vector)
-        danceability = float(dance[0]) if hasattr(dance, "__getitem__") else float(dance)
 
-        # 调式提取
-        key_ext = es.KeyExtractor()
-        key, scale, key_conf = key_ext(audio_vector)
+# =========================
+# API
+# =========================
 
-        result = {
-            "bpm": round(float(bpm), 2),
-            "bpm_confidence": round(float(bpm_conf), 2),
-            "danceability": round(danceability, 2),
-            "key": str(key),
-            "scale": str(scale),
-            "key_confidence": round(float(key_conf), 2),
-            "analysis_duration": round(duration, 1),
-        }
-
-        logger.info("特征提取完成: %s", result)
-        return result
-
-    except Exception as e:
-        logger.exception("特征提取过程中发生错误: %s", audio_path)
-        raise
+@app.get("/health")
+async def health():
+    return {
+        "status": "ok",
+        "cache_size": len(feature_cache),
+        "workers": MAX_WORKERS,
+    }
 
 
 @app.get("/analyze/{audio_path:path}")
 async def analyze(audio_path: str):
-    logger.info("收到分析请求: %s", audio_path)
+    full_path = resolve_audio_path(
+        audio_path
+    )
 
-    # 路径解析与安全校验
-    try:
-        full_path = (MUSIC_ROOT / audio_path.lstrip("/")).resolve(strict=False)
+    logger.info(
+        "Request analysis: %s",
+        str(full_path),
+    )
 
-        # 严格路径穿越防护
-        if not str(full_path).startswith(str(MUSIC_ROOT)):
-            logger.warning("非法路径尝试: %s", full_path)
-            raise HTTPException(status_code=403, detail="非法路径")
+    async with analysis_semaphore:
+        try:
+            loop = asyncio.get_running_loop()
 
-        if not full_path.is_file():
-            logger.warning("文件不存在: %s", full_path)
-            raise HTTPException(status_code=404, detail="文件不存在")
-    except Exception as e:
-        logger.warning("路径处理异常: %s", str(e))
-        raise HTTPException(status_code=400, detail="路径无效")
+            result = await loop.run_in_executor(
+                executor,
+                extract_features,
+                str(full_path),
+            )
 
-    logger.info("文件有效，开始分析: %s", full_path)
+            return {
+                "status": "success",
+                "file": audio_path,
+                "data": result,
+            }
 
-    try:
-        # 在进程池中执行CPU密集任务
-        loop = asyncio.get_running_loop()
-        result = await loop.run_in_executor(
-            executor, extract_features, str(full_path)
-        )
+        except HTTPException:
+            raise
 
-        return {
-            "status": "success",
-            "data": result,
-            "file": audio_path
-        }
-    except Exception as e:
-        logger.error("分析失败: %s", full_path)
-        raise HTTPException(
-            status_code=500,
-            detail="音乐特征分析失败，请检查日志或稍后重试"
-        )
+        except Exception:
+            logger.exception(
+                "Analysis failed: %s",
+                str(full_path),
+            )
+
+            raise HTTPException(
+                status_code=500,
+                detail="Analysis failed",
+            )
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=PORT)
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=PORT,
+    )
