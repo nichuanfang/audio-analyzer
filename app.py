@@ -1,11 +1,12 @@
 import logging
 import os
 from pathlib import Path
+import asyncio
+from concurrent.futures import ProcessPoolExecutor
 
 import essentia.standard as es
 import uvicorn
 from fastapi import FastAPI, HTTPException
-from fastapi.concurrency import run_in_threadpool
 
 logging.basicConfig(
     level=logging.INFO,
@@ -15,18 +16,20 @@ logger = logging.getLogger("music-analyzer")
 
 app = FastAPI()
 
-# 容器内挂载的根目录
 MUSIC_ROOT = Path(os.getenv("MUSIC_ROOT", "/music")).resolve()
 PORT = int(os.getenv("PORT", 8000))
 
 logger.info("MUSIC_ROOT = %s", MUSIC_ROOT)
+
+# 创建全局ProcessPoolExecutor，建议调整max_workers为CPU核数或适合的值
+executor = ProcessPoolExecutor(max_workers=os.cpu_count() or 2)
 
 
 def extract_features(audio_path: str) -> dict:
     logger.info("开始提取特征: %s", audio_path)
 
     loader = es.EasyLoader(
-        filename=audio_path, sampleRate=44100, startTime=0, endTime=360
+        filename=audio_path, sampleRate=44100, startTime=0, endTime=200
     )
     audio_vector = loader()
     logger.info("音频加载完成,采样点数: %d", len(audio_vector))
@@ -61,11 +64,11 @@ def extract_features(audio_path: str) -> dict:
 async def analyze(audio_path: str):
     logger.info("收到请求, audio_path=%r", audio_path)
 
-    # 拼接并解析出容器内的绝对路径
+    # 解析出绝对路径
     full_path = (MUSIC_ROOT / audio_path).resolve()
     logger.info("解析后的完整路径: %s", full_path)
 
-    # 防止路径遍历：确保最终路径仍位于 MUSIC_ROOT 内
+    # 路径安全校验
     try:
         full_path.relative_to(MUSIC_ROOT)
     except ValueError:
@@ -74,22 +77,19 @@ async def analyze(audio_path: str):
 
     if not full_path.is_file():
         logger.warning("文件不存在: %s", full_path)
-        # 额外打印父目录下的文件列表,辅助排查编码问题
-        parent = full_path.parent
-        if parent.is_dir():
-            try:
-                entries = os.listdir(parent)
-                logger.info("父目录 %s 下的文件: %s", parent, entries)
-            except Exception as e:
-                logger.warning("无法列出父目录: %s", e)
-        else:
-            logger.warning("父目录也不存在: %s", parent)
+        try:
+            parent_files = os.listdir(full_path.parent) if full_path.parent.is_dir() else []
+            logger.info("父目录 %s 下的文件: %s", full_path.parent, parent_files)
+        except Exception as e:
+            logger.warning("父目录无法访问: %s", e)
         raise HTTPException(status_code=404, detail=f"文件不存在: {audio_path}")
 
-    logger.info("文件存在,开始分析: %s", full_path)
+    logger.info("文件存在，开始分析: %s", full_path)
 
+    loop = asyncio.get_running_loop()
     try:
-        result = await run_in_threadpool(extract_features, str(full_path))
+        # 使用进程池并行执行CPU密集型任务
+        result = await loop.run_in_executor(executor, extract_features, str(full_path))
         logger.info("分析成功: %s", full_path)
         return {"status": "success", "data": result}
     except Exception as e:
