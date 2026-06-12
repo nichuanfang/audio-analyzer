@@ -9,7 +9,7 @@ from fastapi.concurrency import run_in_threadpool
 app = FastAPI()
 
 # 容器内挂载的根目录
-MUSIC_ROOT = Path(os.getenv("MUSIC_ROOT", "/music")).resolve()
+MUSIC_ROOT = Path(os.getenv("MUSIC_ROOT", "music")).resolve()
 PORT = int(os.getenv("PORT", 8000))
 
 

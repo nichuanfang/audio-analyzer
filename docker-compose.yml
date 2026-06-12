@@ -1,6 +1,6 @@
 services:
   music-analyzer:
-    build: .
+    image: ghcr.io/nichuanfang/audio-analyzer:latest
     container_name: music-analyzer
     restart: unless-stopped
     ports:
