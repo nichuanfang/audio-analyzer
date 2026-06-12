@@ -3,6 +3,8 @@ import os
 from pathlib import Path
 import asyncio
 from concurrent.futures import ProcessPoolExecutor
+from contextlib import asynccontextmanager
+from functools import lru_cache
 
 import essentia.standard as es
 import uvicorn
@@ -14,87 +16,127 @@ logging.basicConfig(
 )
 logger = logging.getLogger("music-analyzer")
 
-app = FastAPI()
-
+# 配置参数
 MUSIC_ROOT = Path(os.getenv("MUSIC_ROOT", "/music")).resolve()
 PORT = int(os.getenv("PORT", 8000))
+MAX_ANALYSIS_SECONDS = 200  # 适合NAS性能，降低CPU负担
+CACHE_SIZE = 128  # 内存缓存大小，根据NAS内存调整
 
 logger.info("MUSIC_ROOT = %s", MUSIC_ROOT)
+logger.info("MAX_ANALYSIS_SECONDS = %d", MAX_ANALYSIS_SECONDS)
 
-# 创建全局ProcessPoolExecutor，建议调整max_workers为CPU核数或适合的值
-executor = ProcessPoolExecutor(max_workers=os.cpu_count() or 2)
+# 全局进程池
+executor: ProcessPoolExecutor | None = None
 
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global executor
+    # Startup
+    executor = ProcessPoolExecutor(max_workers=os.cpu_count() or 2)
+    logger.info("ProcessPoolExecutor 已启动，workers=%d", executor._max_workers)
+    yield
+    # Shutdown
+    if executor:
+        executor.shutdown(wait=True)
+        logger.info("ProcessPoolExecutor 已关闭")
+
+
+app = FastAPI(lifespan=lifespan)
+
+
+@lru_cache(maxsize=CACHE_SIZE)
 def extract_features(audio_path: str) -> dict:
+    """CPU密集型特征提取函数（带缓存）"""
     logger.info("开始提取特征: %s", audio_path)
 
-    loader = es.EasyLoader(
-        filename=audio_path, sampleRate=44100, startTime=0, endTime=200
-    )
-    audio_vector = loader()
-    logger.info("音频加载完成,采样点数: %d", len(audio_vector))
+    try:
+        loader = es.EasyLoader(
+            filename=audio_path,
+            sampleRate=44100,
+            startTime=0,
+            endTime=MAX_ANALYSIS_SECONDS,
+        )
+        audio_vector = loader()
+        logger.info("音频加载完成，采样点数: %d", len(audio_vector))
 
-    if len(audio_vector) == 0:
-        raise ValueError("音频内容为空或无法解码")
+        if len(audio_vector) == 0:
+            raise ValueError("音频内容为空或无法解码")
 
-    rhythm = es.RhythmExtractor2013(method="multifeature")
-    bpm, _, bpm_conf, _, _ = rhythm(audio_vector)
-    logger.info("节奏提取完成: bpm=%.2f, conf=%.2f", bpm, bpm_conf)
+        duration = len(audio_vector) / 44100
+        if duration < 10:
+            logger.warning("音频过短（%.1f秒），特征提取准确性可能降低", duration)
 
-    dance = es.Danceability()(audio_vector)
-    logger.info("舞曲度提取完成: %.2f", dance[0])
+        # 节奏提取（multifeature 精度较高但较慢）
+        rhythm = es.RhythmExtractor2013(method="multifeature")
+        bpm, _, bpm_conf, _, _ = rhythm(audio_vector)
 
-    key_ext = es.KeyExtractor()
-    key, scale, key_conf = key_ext(audio_vector)
-    logger.info("调式提取完成: key=%s, scale=%s, conf=%.2f", key, scale, key_conf)
+        # 舞曲度
+        dance = es.Danceability()(audio_vector)
+        danceability = float(dance[0]) if hasattr(dance, "__getitem__") else float(dance)
 
-    result = {
-        "bpm": round(float(bpm), 2),
-        "bpm_confidence": round(float(bpm_conf), 2),
-        "danceability": round(float(dance[0]), 2),
-        "key": str(key),
-        "scale": str(scale),
-        "key_confidence": round(float(key_conf), 2),
-    }
-    logger.info("特征提取结果: %s", result)
-    return result
+        # 调式提取
+        key_ext = es.KeyExtractor()
+        key, scale, key_conf = key_ext(audio_vector)
+
+        result = {
+            "bpm": round(float(bpm), 2),
+            "bpm_confidence": round(float(bpm_conf), 2),
+            "danceability": round(danceability, 2),
+            "key": str(key),
+            "scale": str(scale),
+            "key_confidence": round(float(key_conf), 2),
+            "analysis_duration": round(duration, 1),
+        }
+
+        logger.info("特征提取完成: %s", result)
+        return result
+
+    except Exception as e:
+        logger.exception("特征提取过程中发生错误: %s", audio_path)
+        raise
 
 
 @app.get("/analyze/{audio_path:path}")
 async def analyze(audio_path: str):
-    logger.info("收到请求, audio_path=%r", audio_path)
+    logger.info("收到分析请求: %s", audio_path)
 
-    # 解析出绝对路径
-    full_path = (MUSIC_ROOT / audio_path).resolve()
-    logger.info("解析后的完整路径: %s", full_path)
-
-    # 路径安全校验
+    # 路径解析与安全校验
     try:
-        full_path.relative_to(MUSIC_ROOT)
-    except ValueError:
-        logger.warning("非法路径(超出 MUSIC_ROOT): %s", full_path)
-        raise HTTPException(status_code=403, detail="非法路径")
+        full_path = (MUSIC_ROOT / audio_path.lstrip("/")).resolve(strict=False)
 
-    if not full_path.is_file():
-        logger.warning("文件不存在: %s", full_path)
-        try:
-            parent_files = os.listdir(full_path.parent) if full_path.parent.is_dir() else []
-            logger.info("父目录 %s 下的文件: %s", full_path.parent, parent_files)
-        except Exception as e:
-            logger.warning("父目录无法访问: %s", e)
-        raise HTTPException(status_code=404, detail=f"文件不存在: {audio_path}")
+        # 严格路径穿越防护
+        if not str(full_path).startswith(str(MUSIC_ROOT)):
+            logger.warning("非法路径尝试: %s", full_path)
+            raise HTTPException(status_code=403, detail="非法路径")
 
-    logger.info("文件存在，开始分析: %s", full_path)
-
-    loop = asyncio.get_running_loop()
-    try:
-        # 使用进程池并行执行CPU密集型任务
-        result = await loop.run_in_executor(executor, extract_features, str(full_path))
-        logger.info("分析成功: %s", full_path)
-        return {"status": "success", "data": result}
+        if not full_path.is_file():
+            logger.warning("文件不存在: %s", full_path)
+            raise HTTPException(status_code=404, detail="文件不存在")
     except Exception as e:
-        logger.exception("特征分析失败: %s", full_path)
-        raise HTTPException(status_code=500, detail=f"特征分析失败: {str(e)}")
+        logger.warning("路径处理异常: %s", str(e))
+        raise HTTPException(status_code=400, detail="路径无效")
+
+    logger.info("文件有效，开始分析: %s", full_path)
+
+    try:
+        # 在进程池中执行CPU密集任务
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(
+            executor, extract_features, str(full_path)
+        )
+
+        return {
+            "status": "success",
+            "data": result,
+            "file": audio_path
+        }
+    except Exception as e:
+        logger.error("分析失败: %s", full_path)
+        raise HTTPException(
+            status_code=500,
+            detail="音乐特征分析失败，请检查日志或稍后重试"
+        )
 
 
 if __name__ == "__main__":
