@@ -1,78 +1,66 @@
 import asyncio
 import logging
 import os
+import sys
+import time
+import uuid
 from concurrent.futures import ProcessPoolExecutor
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 import essentia.standard as es
 import uvicorn
-from cachetools import TTLCache, cached
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import ORJSONResponse
+
+
+# =========================
+# Logging
+# =========================
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
+    stream=sys.stdout,
+    format="%(asctime)s | %(levelname)s | %(message)s",
 )
 
 logger = logging.getLogger("music-analyzer")
+
+
+def log(tag: str, icon: str, msg: str, **fields):
+    extra = " ".join(f"{k}={v}" for k, v in fields.items())
+    logger.info(f"{icon} [{tag}] {msg} {extra}".rstrip())
+
 
 # =========================
 # Config
 # =========================
 
-MUSIC_ROOT = Path(
-    os.getenv("MUSIC_ROOT", "/music")
-).resolve()
-
+MUSIC_ROOT = Path(os.getenv("MUSIC_ROOT", "./music")).resolve()
 PORT = int(os.getenv("PORT", "8000"))
 
 MAX_ANALYSIS_SECONDS = 200
-
-MAX_WORKERS = min(
-    max((os.cpu_count() or 2) // 2, 1),
-    4,
-)
-
-CACHE_SIZE = 256
-CACHE_TTL = 86400  # 24h
-
-logger.info("MUSIC_ROOT=%s", MUSIC_ROOT)
-logger.info("MAX_WORKERS=%s", MAX_WORKERS)
-
-# =========================
-# Runtime
-# =========================
+MAX_WORKERS = min(max((os.cpu_count() or 2) // 2, 1), 4)
 
 executor: ProcessPoolExecutor | None = None
-
-feature_cache = TTLCache(
-    maxsize=CACHE_SIZE,
-    ttl=CACHE_TTL,
-)
-
 analysis_semaphore = asyncio.Semaphore(MAX_WORKERS)
 
+# ⚠️ multiprocessing-safe cache（必须显式，不用 decorator）
+CACHE: dict[str, dict] = {}
+
+
+# =========================
+# Lifespan
+# =========================
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global executor
-
-    executor = ProcessPoolExecutor(
-        max_workers=MAX_WORKERS
-    )
-
-    logger.info(
-        "ProcessPoolExecutor started workers=%s",
-        MAX_WORKERS,
-    )
-
+    executor = ProcessPoolExecutor(max_workers=MAX_WORKERS)
+    log("POOL", "⚙️", "started", workers=MAX_WORKERS)
     yield
-
-    if executor:
-        executor.shutdown(wait=True)
-        logger.info("ProcessPoolExecutor stopped")
+    executor.shutdown(wait=True)
+    log("POOL", "⚙️", "stopped")
 
 
 app = FastAPI(
@@ -83,94 +71,110 @@ app = FastAPI(
 
 
 # =========================
-# Feature Extraction
+# Middleware (trace + latency)
 # =========================
 
-@cached(feature_cache)
-def extract_features(audio_path: str) -> dict:
-    logger.info("Analyzing: %s", audio_path)
+@app.middleware("http")
+async def trace(request: Request, call_next):
+    request_id = uuid.uuid4().hex[:8]
+    start = time.monotonic()
 
-    loader = es.EasyLoader(
+    log("REQ", "🌐", "start", id=request_id, path=request.url.path)
+
+    try:
+        response = await call_next(request)
+        cost = (time.monotonic() - start) * 1000
+
+        log("RES", "🌐", "done",
+            id=request_id,
+            status=response.status_code,
+            cost_ms=round(cost, 2))
+
+        return response
+
+    except Exception:
+        cost = (time.monotonic() - start) * 1000
+        log("ERR", "❌", "failed", id=request_id, cost_ms=round(cost, 2))
+        raise
+
+
+# =========================
+# FS
+# =========================
+
+def resolve_audio_path(rel: str) -> Path:
+    full = (MUSIC_ROOT / rel.lstrip("/")).resolve()
+
+    try:
+        full.relative_to(MUSIC_ROOT)
+    except ValueError:
+        raise HTTPException(403, "illegal path")
+
+    if not full.exists():
+        raise HTTPException(404, "not found")
+
+    return full
+
+
+# =========================
+# CACHE (correct semantics)
+# =========================
+
+def cache_get(key: str):
+    return CACHE.get(key)
+
+
+def cache_set(key: str, value: dict):
+    CACHE[key] = value
+
+
+# =========================
+# Feature extraction (CPU bound)
+# =========================
+
+def extract_features(audio_path: str) -> dict:
+    log("AUDIO", "🎧", "start", file=audio_path)
+
+    t0 = time.monotonic()
+
+    audio = es.EasyLoader(
         filename=audio_path,
         sampleRate=44100,
         startTime=0,
         endTime=MAX_ANALYSIS_SECONDS,
-    )
-
-    audio = loader()
+    )()
 
     if len(audio) == 0:
-        raise ValueError("Empty audio")
+        raise ValueError("empty audio")
 
     duration = len(audio) / 44100
 
-    rhythm = es.RhythmExtractor2013(
-        method="multifeature"
-    )
+    rhythm = es.RhythmExtractor2013(method="multifeature")
+    bpm, _, bpm_conf, *_ = rhythm(audio)
 
-    rhythm_result = rhythm(audio)
+    dance = es.Danceability()(audio)
+    dance = float(dance[0]) if isinstance(dance, tuple) else float(dance)
 
-    bpm = float(rhythm_result[0])
-    bpm_conf = float(rhythm_result[2])
+    key, scale, key_conf = es.KeyExtractor()(audio)
 
-    dance_result = es.Danceability()(audio)
-
-    if isinstance(dance_result, tuple):
-        danceability = float(dance_result[0])
-    elif hasattr(dance_result, "__getitem__"):
-        danceability = float(dance_result[0])
-    else:
-        danceability = float(dance_result)
-
-    key_result = es.KeyExtractor()(audio)
-
-    key = str(key_result[0])
-    scale = str(key_result[1])
-    key_conf = float(key_result[2])
-
-    return {
-        "bpm": round(bpm, 2),
-        "bpm_confidence": round(bpm_conf, 2),
-        "danceability": round(danceability, 2),
-        "key": key,
-        "scale": scale,
-        "key_confidence": round(key_conf, 2),
-        "analysis_duration": round(duration, 1),
+    result = {
+        "bpm": round(float(bpm), 2),
+        "bpm_confidence": round(float(bpm_conf), 2),
+        "danceability": round(dance, 2),
+        "key": str(key),
+        "scale": str(scale),
+        "key_confidence": round(float(key_conf), 2),
+        "duration": round(duration, 1),
     }
 
+    cost = (time.monotonic() - t0) * 1000
 
-# =========================
-# Helpers
-# =========================
+    log("AUDIO", "🎧", "done",
+        bpm=result["bpm"],
+        key=result["key"],
+        cost_ms=round(cost, 2))
 
-def resolve_audio_path(
-    relative_path: str,
-) -> Path:
-    full_path = (
-        MUSIC_ROOT / relative_path.lstrip("/")
-    ).resolve()
-
-    try:
-        full_path.relative_to(MUSIC_ROOT)
-    except ValueError:
-        raise HTTPException(
-            status_code=403,
-            detail="Illegal path",
-        )
-
-    if not full_path.exists():
-        raise HTTPException(
-            status_code=404,
-            detail="File not found",
-        )
-
-    if not full_path.is_file():
-        raise HTTPException(
-            status_code=400,
-            detail="Not a file",
-        )
-
-    return full_path
+    return result
 
 
 # =========================
@@ -179,58 +183,57 @@ def resolve_audio_path(
 
 @app.get("/health")
 async def health():
-    return {
-        "status": "ok",
-        "cache_size": len(feature_cache),
-        "workers": MAX_WORKERS,
-    }
+    return {"status": "ok", "cache_size": len(CACHE)}
 
 
 @app.get("/analyze/{audio_path:path}")
 async def analyze(audio_path: str):
-    full_path = resolve_audio_path(
-        audio_path
-    )
+    full = resolve_audio_path(audio_path)
+    key = str(full)
 
-    logger.info(
-        "Request analysis: %s",
-        str(full_path),
-    )
+    log("API", "🌐", "analyze", file=key)
 
+    # 1. cache hit path
+    cached = cache_get(key)
+    if cached:
+        log("CACHE", "🧠", "hit", file=key)
+        return {
+            "status": "success",
+            "source": "cache",
+            "file": audio_path,
+            "data": cached,
+        }
+
+    log("CACHE", "🧠", "miss", file=key)
+
+    # 2. compute path
     async with analysis_semaphore:
-        try:
-            loop = asyncio.get_running_loop()
+        loop = asyncio.get_running_loop()
 
-            result = await loop.run_in_executor(
-                executor,
-                extract_features,
-                str(full_path),
-            )
+        result = await loop.run_in_executor(
+            executor,
+            extract_features,
+            key,
+        )
 
-            return {
-                "status": "success",
-                "file": audio_path,
-                "data": result,
-            }
+    cache_set(key, result)
 
-        except HTTPException:
-            raise
+    return {
+        "status": "success",
+        "source": "compute",
+        "file": audio_path,
+        "data": result,
+    }
 
-        except Exception:
-            logger.exception(
-                "Analysis failed: %s",
-                str(full_path),
-            )
 
-            raise HTTPException(
-                status_code=500,
-                detail="Analysis failed",
-            )
-
+# =========================
+# main
+# =========================
 
 if __name__ == "__main__":
     uvicorn.run(
         app,
         host="0.0.0.0",
         port=PORT,
+        access_log=False,
     )
