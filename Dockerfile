@@ -27,17 +27,19 @@ RUN pip install --no-cache-dir --upgrade pip && \
 # ---------- 运行阶段 ----------
 FROM python:3.10-slim
 
-# 运行时只需要动态链接库，不需要 -dev 头文件和编译工具
+# 运行时只需要这些库（不需要 build-essential / pkg-config 编译工具），
+# 但保留 -dev 包名以避免因 Debian 版本不同导致的 .so 版本号包名不匹配问题。
+# 这些包里既包含 .so 也包含头文件，多出来的体积只是头文件，不大。
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    libfftw3-3 \
-    libyaml-0-2 \
-    libtag1v5 \
-    libsamplerate0 \
-    libchromaprint1 \
-    libavcodec59 \
-    libavformat59 \
-    libavutil57 \
-    libswresample4 \
+    libfftw3-dev \
+    libyaml-dev \
+    libtag1-dev \
+    libsamplerate0-dev \
+    libchromaprint-dev \
+    libavcodec-dev \
+    libavformat-dev \
+    libavutil-dev \
+    libswresample-dev \
     ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
