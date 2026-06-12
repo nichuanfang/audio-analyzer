@@ -1,31 +1,26 @@
-FROM python:3.10-slim AS builder
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential cmake git pkg-config \
-    libfftw3-dev libyaml-dev libsamplerate0-dev \
-    libtag1-dev libavcodec-dev libavformat-dev libavutil-dev \
-    && rm -rf /var/lib/apt/lists/*
-
-WORKDIR /wheels
-
-COPY requirements.txt .
-
-RUN pip install --upgrade pip && \
-    pip wheel --no-cache-dir -r requirements.txt
-
-
 FROM python:3.10-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    libfftw3-3 libyaml-0-2 libsamplerate0 libtag1v5 \
-    libavcodec59 libavformat59 libavutil57 \
+    build-essential \
+    libfftw3-dev \
+    libyaml-dev \
+    libtag1-dev \
+    libsamplerate0-dev \
+    libchromaprint-dev \
+    libavcodec-dev \
+    libavformat-dev \
+    libavutil-dev \
+    libswresample-dev \
+    ffmpeg \
+    pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-COPY --from=builder /wheels /wheels
+COPY requirements.txt .
 
-RUN pip install --no-cache-dir /wheels/*
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir -r requirements.txt
 
 COPY app.py .
 
