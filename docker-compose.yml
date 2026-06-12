@@ -1,0 +1,12 @@
+services:
+  music-analyzer:
+    build: .
+    container_name: music-analyzer
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - MUSIC_ROOT=/music      # 音乐根目录
+      - PORT=8000              # 端口
+    volumes:
+      - /mnt/nas/music:/music:ro
