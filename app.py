@@ -38,14 +38,13 @@ def log(tag: str, icon: str, msg: str, **fields):
 
 MUSIC_ROOT = Path(os.getenv("MUSIC_ROOT", "./music")).resolve()
 PORT = int(os.getenv("PORT", "8000"))
+MAX_ANALYSIS_SECONDS = int(os.getenv("MAX_ANALYSIS_SECONDS", "300"))
 
-MAX_ANALYSIS_SECONDS = 200
 MAX_WORKERS = min(max((os.cpu_count() or 2) // 2, 1), 4)
 
 executor: ProcessPoolExecutor | None = None
 analysis_semaphore = asyncio.Semaphore(MAX_WORKERS)
 
-# ⚠️ multiprocessing-safe cache（必须显式，不用 decorator）
 CACHE: dict[str, dict] = {}
 
 

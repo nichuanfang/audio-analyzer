@@ -8,5 +8,6 @@ services:
     environment:
       - MUSIC_ROOT=/music      # 音乐根目录
       - PORT=8000              # 端口
+      - MAX_ANALYSIS_SECONDS=300 # 最大分析时长(秒)
     volumes:
       - /mnt/nas/music:/music:ro
