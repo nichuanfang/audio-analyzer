@@ -19,7 +19,6 @@ WORKDIR /app
 
 COPY requirements.txt .
 
-# 将依赖安装到独立目录，方便后续复制
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir --prefix=/install -r requirements.txt
 
@@ -27,9 +26,9 @@ RUN pip install --no-cache-dir --upgrade pip && \
 # ---------- 运行阶段 ----------
 FROM python:3.10-slim
 
-# 运行时只需要这些库（不需要 build-essential / pkg-config 编译工具），
-# 但保留 -dev 包名以避免因 Debian 版本不同导致的 .so 版本号包名不匹配问题。
-# 这些包里既包含 .so 也包含头文件，多出来的体积只是头文件，不大。
+# 设置中国上海时区（Asia/Shanghai）
+ENV TZ=Asia/Shanghai
+
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libfftw3-dev \
     libyaml-dev \
@@ -41,6 +40,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libavutil-dev \
     libswresample-dev \
     ffmpeg \
+    tzdata \
+    && ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime \
+    && echo "Asia/Shanghai" > /etc/timezone \
+    && dpkg-reconfigure -f noninteractive tzdata \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -53,6 +56,7 @@ COPY app.py .
 ENV MUSIC_ROOT=/music
 ENV PORT=8000
 ENV MAX_ANALYSIS_SECONDS=300
+ENV LOG_LEVEL=INFO
 
 EXPOSE 8000
 
